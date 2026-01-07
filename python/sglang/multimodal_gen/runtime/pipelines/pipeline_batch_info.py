@@ -200,6 +200,9 @@ class Req:
     # debugging
     debug: bool = False
 
+    # LoRA parameters
+    lora_nickname: str | None = None
+
     # results
     output: torch.Tensor | None = None
 

@@ -136,6 +136,9 @@ class SamplingParams:
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
 
+    # LoRA parameters
+    lora_nickname: str | None = None
+
     def set_output_file_ext(self):
         # add extension if needed
         if not any(

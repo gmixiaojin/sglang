@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import (
+    OutputBatch,
+    Req,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -48,6 +52,10 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_rank: int | None = None
     lora_alpha: int | None = None
     lora_initialized: bool = False
+
+    # Multi-LoRA batching support
+    _lora_nickname_to_index: dict[str, int] = {}
+    _lora_adapter_configs: dict[str, dict] = {}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -225,3 +233,159 @@ class LoRAPipeline(ComposedPipelineBase):
     def unmerge_lora_weights(self) -> None:
         for name, layer in self.lora_layers.items():
             layer.unmerge_lora_weights()
+
+    def _load_lora_adapter(self, lora_path: str, lora_nickname: str) -> None:
+        lora_local_path = maybe_download_lora(lora_path)
+        lora_state_dict = load_file(lora_local_path)
+
+        # Map the hf layer names to our custom layer names
+        param_names_mapping_fn = get_param_names_mapping(
+            self.modules["transformer"].param_names_mapping
+        )
+        lora_param_names_mapping_fn = get_param_names_mapping(
+            self.modules["transformer"].lora_param_names_mapping
+        )
+
+        to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
+        for name, weight in lora_state_dict.items():
+            name = name.replace("diffusion_model.", "")
+            name = name.replace(".weight", "")
+            name, _, _ = lora_param_names_mapping_fn(name)
+            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(
+                name
+            )
+            # for (in_dim, r) @ (r, out_dim), we only merge (r, out_dim * n) where n is the number of linear layers to fuse
+            # see param mapping in HunyuanVideoArchConfig
+            if merge_index is not None and "lora_B" in name:
+                to_merge_params[target_name][merge_index] = weight
+                if len(to_merge_params[target_name]) == num_params_to_merge:
+                    # cat at output dim according to the merge_index order
+                    sorted_tensors = [
+                        to_merge_params[target_name][i]
+                        for i in range(num_params_to_merge)
+                    ]
+                    weight = torch.cat(sorted_tensors, dim=1)
+                    del to_merge_params[target_name]
+                else:
+                    continue
+
+            if target_name in self.lora_adapters[lora_nickname]:
+                raise ValueError(
+                    f"Target name {target_name} already exists in lora_adapters[{lora_nickname}]"
+                )
+            self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
+        logger.info("Rank %d: loaded LoRA adapter %s", dist.get_rank(), lora_path)
+
+    def preload_lora_adapter(
+        self,
+        lora_nickname: str,
+        lora_path: str,
+        alpha: float | None = None,
+        rank: int | None = None,
+    ) -> None:
+        
+        if not self.lora_initialized:
+            self.convert_to_lora_layers()
+
+        # Load adapter if not already loaded
+        if lora_nickname not in self.lora_adapters:
+            self._load_lora_adapter(lora_path, lora_nickname)
+
+        # Assign index
+        if lora_nickname not in self._lora_nickname_to_index:
+            self._lora_nickname_to_index[lora_nickname] = len(
+                self._lora_nickname_to_index
+            )
+
+        # Infer rank from weights if not provided
+        if rank is None:
+            for weight_name, weight in self.lora_adapters[lora_nickname].items():
+                if "lora_A" in weight_name:
+                    rank = weight.shape[0]
+                    break
+            rank = rank or 16
+
+        self._lora_adapter_configs[lora_nickname] = {
+            "alpha": alpha if alpha is not None else rank,
+            "rank": rank,
+        }
+        logger.info(
+            "Preloaded LoRA '%s' (index=%d)",
+            lora_nickname,
+            self._lora_nickname_to_index[lora_nickname],
+        )
+
+    def _set_multi_lora_state_on_layers(
+        self, batch: Req, target_layers: dict[str, BaseLayerWithLoRA]
+    ) -> None:
+        
+        if batch.lora_nickname is None:
+            return
+
+        if batch.lora_nickname not in self._lora_nickname_to_index:
+            logger.warning("LoRA '%s' not preloaded, skipping", batch.lora_nickname)
+            return
+
+        # Build active_lora_indices from batch
+        # For now, assume single LoRA per batch (can be extended for per-sample LoRA)
+        batch_size = batch.batch_size
+        lora_idx = self._lora_nickname_to_index[batch.lora_nickname]
+        active_indices = torch.full(
+            (batch_size,), lora_idx, dtype=torch.long, device=self.device
+        )
+
+        # Set state on all layers
+        for layer_name, layer in target_layers.items():
+            # Build weights pool for this specific layer
+            lora_weights_pool: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            lora_A_name = layer_name + ".lora_A"
+            lora_B_name = layer_name + ".lora_B"
+            for nickname in self._lora_nickname_to_index.keys():
+                if (
+                    lora_A_name in self.lora_adapters[nickname]
+                    and lora_B_name in self.lora_adapters[nickname]
+                ):
+                    lora_weights_pool[nickname] = (
+                        self.lora_adapters[nickname][lora_A_name],
+                        self.lora_adapters[nickname][lora_B_name],
+                    )
+
+            layer.set_multi_lora_state(
+                active_lora_indices=active_indices,
+                lora_weights_pool=lora_weights_pool,
+                lora_nickname_to_index=self._lora_nickname_to_index,
+                lora_adapter_configs=self._lora_adapter_configs,
+            )
+            layer.layer_name = layer_name
+
+    def _clear_multi_lora_state_on_layers(
+        self, target_layers: dict[str, BaseLayerWithLoRA]
+    ) -> None:
+        """Clear multi-LoRA state from layers."""
+        for layer in target_layers.values():
+            layer.clear_multi_lora_state()
+
+    @torch.no_grad()
+    def forward(
+        self, batch: Req, server_args: ServerArgs
+    ) -> OutputBatch:
+
+        use_multi_lora = (
+            batch.lora_nickname is not None
+            and batch.lora_nickname in self._lora_nickname_to_index
+        )
+
+        if use_multi_lora:
+            self._set_multi_lora_state_on_layers(batch, self.lora_layers)
+            if self.lora_layers_critic:
+                self._set_multi_lora_state_on_layers(batch, self.lora_layers_critic)
+
+        try:
+            result = super().forward(batch, server_args)
+        finally:
+            if use_multi_lora:
+                self._clear_multi_lora_state_on_layers(self.lora_layers)
+                if self.lora_layers_critic:
+                    self._clear_multi_lora_state_on_layers(self.lora_layers_critic)
+
+        return result
