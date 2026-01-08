@@ -2,12 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/forward_batch_info.py
-"""
-Data structures for functional pipeline processing.
-
-This module defines the dataclasses used to pass state between pipeline components
-in a functional manner, reducing the need for explicit parameter passing.
-"""
 
 import pprint
 from dataclasses import asdict, dataclass, field
@@ -201,7 +195,8 @@ class Req:
     debug: bool = False
 
     # LoRA parameters
-    lora_nickname: str | None = None
+    # Support per-sample LoRA: can be a single nickname (str) or a list of nicknames (list[str])
+    lora_nickname: str | list[str] | None = None
 
     # results
     output: torch.Tensor | None = None

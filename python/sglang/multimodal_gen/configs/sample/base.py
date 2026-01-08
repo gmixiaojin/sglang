@@ -137,7 +137,8 @@ class SamplingParams:
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
 
     # LoRA parameters
-    lora_nickname: str | None = None
+    # Support per-sample LoRA: can be a single nickname (str) or a list of nicknames (list[str])
+    lora_nickname: str | list[str] | None = None
 
     def set_output_file_ext(self):
         # add extension if needed

@@ -19,10 +19,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import (
-    OutputBatch,
-    Req,
-)
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -31,10 +28,7 @@ logger = init_logger(__name__)
 
 
 class LoRAPipeline(ComposedPipelineBase):
-    """
-    Pipeline that supports injecting LoRA adapters into the diffusion transformer.
-    TODO: support training.
-    """
+    # Pipeline that supports injecting LoRA adapters into the diffusion transformer.
 
     lora_adapters: dict[str, dict[str, torch.Tensor]] = defaultdict(
         dict
@@ -80,9 +74,7 @@ class LoRAPipeline(ComposedPipelineBase):
         )
 
     def convert_to_lora_layers(self) -> None:
-        """
-        Unified method to convert the transformer to a LoRA transformer.
-        """
+        # Unified method to convert the transformer to a LoRA transformer.
         if self.lora_initialized:
             return
         self.lora_initialized = True
@@ -132,13 +124,8 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def set_lora_adapter(
         self, lora_nickname: str, lora_path: str | None = None
-    ):  # type: ignore
-        """
-        Load a LoRA adapter into the pipeline and merge it into the transformer.
-        Args:
-            lora_nickname: The "nick name" of the adapter when referenced in the pipeline.
-            lora_path: The path to the adapter, either a local path or a Hugging Face repo id.
-        """
+    ):  
+        # Load a LoRA adapter into the pipeline and merge it into the transformer.
 
         if lora_nickname not in self.lora_adapters and lora_path is None:
             raise ValueError(
@@ -251,9 +238,7 @@ class LoRAPipeline(ComposedPipelineBase):
             name = name.replace("diffusion_model.", "")
             name = name.replace(".weight", "")
             name, _, _ = lora_param_names_mapping_fn(name)
-            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(
-                name
-            )
+            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
             # for (in_dim, r) @ (r, out_dim), we only merge (r, out_dim * n) where n is the number of linear layers to fuse
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None and "lora_B" in name:
@@ -283,7 +268,7 @@ class LoRAPipeline(ComposedPipelineBase):
         alpha: float | None = None,
         rank: int | None = None,
     ) -> None:
-        
+
         if not self.lora_initialized:
             self.convert_to_lora_layers()
 
@@ -318,28 +303,41 @@ class LoRAPipeline(ComposedPipelineBase):
     def _set_multi_lora_state_on_layers(
         self, batch: Req, target_layers: dict[str, BaseLayerWithLoRA]
     ) -> None:
-        
-        if batch.lora_nickname is None:
-            return
+        # Set multi-LoRA state for on-the-fly computation.
 
-        if batch.lora_nickname not in self._lora_nickname_to_index:
-            logger.warning("LoRA '%s' not preloaded, skipping", batch.lora_nickname)
-            return
-
-        # Build active_lora_indices from batch
-        # For now, assume single LoRA per batch (can be extended for per-sample LoRA)
+        # Build active_lora_indices per sample
         batch_size = batch.batch_size
-        lora_idx = self._lora_nickname_to_index[batch.lora_nickname]
-        active_indices = torch.full(
-            (batch_size,), lora_idx, dtype=torch.long, device=self.device
-        )
-
+        
+        # Support per-sample LoRA
+        if isinstance(batch.lora_nickname, list):
+            # Per-sample LoRA: [nickname1, nickname2, ...]
+            active_indices = torch.zeros(
+                (batch_size,), dtype=torch.long, device=self.device
+            )
+            for i, nickname in enumerate(batch.lora_nickname):
+                if nickname in self._lora_nickname_to_index:
+                    active_indices[i] = self._lora_nickname_to_index[nickname]
+                else:
+                    active_indices[i] = -1  # No LoRA
+        elif batch.lora_nickname is not None:
+            # Single LoRA for all samples
+            if batch.lora_nickname not in self._lora_nickname_to_index:
+                logger.warning("LoRA '%s' not preloaded, skipping", batch.lora_nickname)
+                return
+            lora_idx = self._lora_nickname_to_index[batch.lora_nickname]
+            active_indices = torch.full(
+                (batch_size,), lora_idx, dtype=torch.long, device=self.device
+            )
+        else:
+            return  # No LoRA requested
+        
         # Set state on all layers
         for layer_name, layer in target_layers.items():
-            # Build weights pool for this specific layer
+            # Build weights pool for this layer
             lora_weights_pool: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
             lora_A_name = layer_name + ".lora_A"
             lora_B_name = layer_name + ".lora_B"
+            
             for nickname in self._lora_nickname_to_index.keys():
                 if (
                     lora_A_name in self.lora_adapters[nickname]
@@ -349,7 +347,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
                     )
-
+            
             layer.set_multi_lora_state(
                 active_lora_indices=active_indices,
                 lora_weights_pool=lora_weights_pool,
@@ -361,19 +359,23 @@ class LoRAPipeline(ComposedPipelineBase):
     def _clear_multi_lora_state_on_layers(
         self, target_layers: dict[str, BaseLayerWithLoRA]
     ) -> None:
-        """Clear multi-LoRA state from layers."""
+        # Clear multi-LoRA state from layers.
         for layer in target_layers.values():
             layer.clear_multi_lora_state()
 
     @torch.no_grad()
-    def forward(
-        self, batch: Req, server_args: ServerArgs
-    ) -> OutputBatch:
-
-        use_multi_lora = (
-            batch.lora_nickname is not None
-            and batch.lora_nickname in self._lora_nickname_to_index
-        )
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        # Check if multi-LoRA is requested
+        if isinstance(batch.lora_nickname, list):
+            # Per-sample LoRA: check if any nickname is valid
+            use_multi_lora = any(
+                nickname in self._lora_nickname_to_index
+                for nickname in batch.lora_nickname
+            )
+        elif batch.lora_nickname is not None:
+            use_multi_lora = batch.lora_nickname in self._lora_nickname_to_index
+        else:
+            use_multi_lora = False
 
         if use_multi_lora:
             self._set_multi_lora_state_on_layers(batch, self.lora_layers)
