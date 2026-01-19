@@ -180,10 +180,9 @@ class LTX2PipelineConfig(PipelineConfig):
     ] = field(default_factory=lambda: (_gemma_postprocess_func,))
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
-        if sigmas is None:
-            return np.linspace(
-                1.0, 1.0 / float(num_inference_steps), int(num_inference_steps)
-            )
+        # Native LTX-2 uses the scheduler's own sigma schedule logic (dynamic shifting
+        # via `mu`, stretching, etc.). Do not override it here unless the user
+        # explicitly provides a custom sigma schedule.
         return sigmas
 
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
